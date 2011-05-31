@@ -1,0 +1,115 @@
+*asm:
+%{mmcu=*:-mmcu=%*}
+
+*asm_debug:
+
+
+*asm_final:
+
+
+*asm_options:
+%a %Y %{c:%W{o*}%{!o*:-o %w%b%O}}%{!c:-o %d%w%u%O}
+
+*invoke_as:
+%{!S:-o %|.s |
+ as %(asm_options) %m.s %A }
+
+*cpp:
+%{posix:-D_POSIX_SOURCE}
+
+*cpp_options:
+%(cpp_unique_options) %1 %{m*} %{std*&ansi&trigraphs} %{W*&pedantic*} %{w} %{f*} %{g*:%{!g0:%{!fno-working-directory:-fworking-directory}}} %{O*} %{undef}
+
+*cpp_debug_options:
+%{d*}
+
+*cpp_unique_options:
+%{C|CC:%{!E:%eGCC does not support -C or -CC without -E}} %{!Q:-quiet} %{nostdinc*} %{C} %{CC} %{v} %{I*} %{P} %I %{MD:-MD %{!o:%b.d}%{o*:%.d%*}} %{MMD:-MMD %{!o:%b.d}%{o*:%.d%*}} %{M} %{MM} %{MF*} %{MG} %{MP} %{MQ*} %{MT*} %{!E:%{!M:%{!MM:%{MD|MMD:%{o*:-MQ %*}}}}} %{remap} %{g3:-dD} %{H} %C %{D*&U*&A*} %{i*} %Z %i %{E|M|MM:%W{o*}}
+
+*trad_capable_cpp:
+cc1 -E %{traditional|ftraditional|traditional-cpp:-traditional-cpp}
+
+*cc1:
+%{profile:-p}
+
+*cc1_options:
+%{pg:%{fomit-frame-pointer:%e-pg and -fomit-frame-pointer are incompatible}} %1 %{!Q:-quiet} -dumpbase %B %{d*} %{m*} %{a*} %{c|S:%{o*:-auxbase-strip %*}%{!o*:-auxbase %b}}%{!c:%{!S:-auxbase %b}} %{g*} %{O*} %{W*&pedantic*} %{w} %{std*&ansi&trigraphs} %{v:-version} %{pg:-p} %{p} %{f*} %{undef} %{Qn:-fno-ident} %{--help:--help} %{--target-help:--target-help} %{!fsyntax-only:%{S:%W{o*}%{!o*:-o %b.s}}} %{fsyntax-only:-o %j} %{-param*}
+
+*cc1plus:
+%{!frtti:-fno-rtti}     %{!fenforce-eh-specs:-fno-enforce-eh-specs}     %{!fexceptions:-fno-exceptions}
+
+*link_gcc_c_sequence:
+%G %L %G
+
+*endfile:
+
+
+*link:
+ %{!mmcu*:-m avr2}%{mmcu=at90s1200|mmcu=attiny1*|mmcu=attiny28:-m avr1} %{mmcu=attiny22|mmcu=attiny26|mmcu=at90s2*|mmcu=at90s4*|mmcu=at90s8*|mmcu=at90c8*|mmcu=at86rf401:-m avr2}%{mmcu=atmega103|mmcu=atmega603|mmcu=at43*|mmcu=at76*:-m avr3}%{mmcu=atmega8*:-m avr4}%{mmcu=atmega16*|mmcu=atmega32*|mmcu=atmega64|mmcu=atmega128|mmcu=at94k:-m avr5}%{mmcu=atmega64|mmcu=atmega128|mmcu=atmega162|mmcu=atmega169: -Tdata 0x800100} 
+
+*lib:
+%{!mmcu=at90s1*:%{!mmcu=attiny1*:%{!mmcu=attiny28: -lc }}}
+
+*libgcc:
+%{!mmcu=at90s1*:%{!mmcu=attiny1*:%{!mmcu=attiny28: -lgcc }}}
+
+*startfile:
+%(crt_binutils)
+
+*switches_need_spaces:
+
+
+*cross_compile:
+1
+
+*version:
+3.4.4
+
+*multilib:
+. !mmcu=avr2 !mmcu=avr3 !mmcu=avr4 !mmcu=avr5;avr2 mmcu=avr2 !mmcu=avr3 !mmcu=avr4 !mmcu=avr5;avr3 !mmcu=avr2 mmcu=avr3 !mmcu=avr4 !mmcu=avr5;avr4 !mmcu=avr2 !mmcu=avr3 mmcu=avr4 !mmcu=avr5;avr5 !mmcu=avr2 !mmcu=avr3 !mmcu=avr4 mmcu=avr5;
+
+*multilib_defaults:
+mmcu=avr2
+
+*multilib_extra:
+
+
+*multilib_matches:
+mmcu=atmega103 mmcu=avr3;mmcu=atmega603 mmcu=avr3;mmcu=at43usb320 mmcu=avr3;mmcu=at43usb355 mmcu=avr3;mmcu=at76c711 mmcu=avr3;mmcu=atmega8515 mmcu=avr4;mmcu=atmega8535 mmcu=avr4;mmcu=atmega8 mmcu=avr4;mmcu=atmega161 mmcu=avr5;mmcu=atmega162 mmcu=avr5;mmcu=atmega163 mmcu=avr5;mmcu=atmega169 mmcu=avr5;mmcu=atmega16 mmcu=avr5;mmcu=atmega323 mmcu=avr5;mmcu=atmega32 mmcu=avr5;mmcu=atmega64 mmcu=avr5;mmcu=atmega128 mmcu=avr5;mmcu=at94k mmcu=avr5;mmcu=avr2 mmcu=avr2;mmcu=avr3 mmcu=avr3;mmcu=avr4 mmcu=avr4;mmcu=avr5 mmcu=avr5;
+
+*multilib_exclusions:
+
+
+*multilib_options:
+mmcu=avr2/mmcu=avr3/mmcu=avr4/mmcu=avr5
+
+*linker:
+ld
+
+*link_libgcc:
+%D
+
+*md_exec_prefix:
+
+
+*md_startfile_prefix:
+
+
+*md_startfile_prefix_1:
+
+
+*startfile_prefix_spec:
+
+
+*sysroot_suffix_spec:
+
+
+*sysroot_hdrs_suffix_spec:
+
+
+*crt_binutils:
+%{mmcu=at90s1200|mmcu=avr1:crts1200.o%s} %{mmcu=attiny11:crttn11.o%s} %{mmcu=attiny12:crttn12.o%s} %{mmcu=attiny15:crttn15.o%s} %{mmcu=attiny28:crttn28.o%s} %{!mmcu*|mmcu=at90s8515|mmcu=avr2:crts8515.o%s} %{mmcu=at90s2313:crts2313.o%s} %{mmcu=at90s2323:crts2323.o%s} %{mmcu=at90s2333:crts2333.o%s} %{mmcu=at90s2343:crts2343.o%s} %{mmcu=attiny22:crttn22.o%s} %{mmcu=attiny26:crttn26.o%s} %{mmcu=at90s4433:crts4433.o%s} %{mmcu=at90s4414:crts4414.o%s} %{mmcu=at90s4434:crts4434.o%s} %{mmcu=at90c8534:crtc8534.o%s} %{mmcu=at90s8535:crts8535.o%s} %{mmcu=at86rf401:crt86401.o%s} %{mmcu=atmega103|mmcu=avr3:crtm103.o%s} %{mmcu=atmega603:crtm603.o%s} %{mmcu=at43usb320:crt43320.o%s} %{mmcu=at43usb355:crt43355.o%s} %{mmcu=at76c711:crt76711.o%s} %{mmcu=atmega8|mmcu=avr4:crtm8.o%s} %{mmcu=atmega8515:crtm8515.o%s} %{mmcu=atmega8535:crtm8535.o%s} %{mmcu=atmega16:crtm16.o%s} %{mmcu=atmega161|mmcu=avr5:crtm161.o%s} %{mmcu=atmega162:crtm162.o%s} %{mmcu=atmega163:crtm163.o%s} %{mmcu=atmega169:crtm169.o%s} %{mmcu=atmega32:crtm32.o%s} %{mmcu=atmega323:crtm323.o%s} %{mmcu=atmega64:crtm64.o%s} %{mmcu=atmega128:crtm128.o%s} %{mmcu=at94k:crtat94k.o%s}
+
+*link_command:
+%{!fsyntax-only:%{!c:%{!M:%{!MM:%{!E:%{!S:    %(linker) %l %{pie:-pie} %X %{o*} %{A} %{d} %{e*} %{m} %{N} %{n} %{r}    %{s} %{t} %{u*} %{x} %{z} %{Z} %{!A:%{!nostdlib:%{!nostartfiles:%S}}}    %{static:} %{L*} %(link_libgcc) %o %{fprofile-arcs|fprofile-generate:-lgcov}    %{!nostdlib:%{!nodefaultlibs:%(link_gcc_c_sequence)}}    %{!A:%{!nostdlib:%{!nostartfiles:%E}}} %{T*} }}}}}}
+

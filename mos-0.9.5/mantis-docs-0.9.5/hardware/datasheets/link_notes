@@ -1,0 +1,9 @@
+Linker notes for avr-ld:
+
+use -Wl in gcc-ld to pass options through to linker (replace spaces with commas)
+use -T option to relocate base pointer for entire sections of code
+	(ex -Ttext 0x1000)
+use --section-start to relocate marked sections of code, example:
+	use --section-start test1=0x1000
+	in code: void blink_red() __attribute__ ((section ("test1")));
+	moves blink_red to specified address for test1

@@ -1,0 +1,782 @@
+#include <inttypes.h>
+#include <stdbool.h>
+#include "msched.h"
+#include "led.h"
+#include "clock.h"
+#include "printf.h"
+#include "com.h"
+#include "node_id.h"
+#include "mutex.h"
+#include <stdlib.h>
+#include "string.h"
+#include "crc.h"
+
+#include "aqueduct.h"
+
+/* Network protocol headers */
+//#include "mst.h"
+//#include "flood.h"
+//#include "simple_proto.h"
+
+#if defined(PLATFORM_MICA2)
+#include "cc1000.h"
+#elseif defined(PLATFORM_MICAZ) || defined(PLATFORM_TELOSB)
+#include "cc2420.h"
+#endif
+
+/****** Begin Helper Functions *******/
+#define GET_AQUEDUCT_PACKET_TYPE(buffer) buffer->data[buffer->size - 1]
+/****** End Helper Functions *******/
+
+static uint8_t my_state;
+static uint16_t my_ID;
+static uint8_t my_dtb;
+static comBuf my_buf;
+
+mos_mutex_t my_state_lock; /* Keeps the listening thread in check */
+mos_mutex_t my_listen_lock; /* Keeps the listening thread in check */
+
+static uint8_t my_app_count;
+static aqueduct_app my_app_memory[AQUEDUCT_MAX_IMAGES_STORED];
+
+static void change_state(uint8_t new_state);
+static uint32_t random_time(uint32_t low, uint32_t high);
+static void reset_logs();
+static void send_request(aqueduct_app *app, uint16_t id_S);
+static void aqueduct_rx(aqueduct_app *app, uint16_t id_S);
+//static bool equal_profiles(aqueduct_profile *p1, aqueduct_profile *p2);
+//static void log_summary(aqueduct_summary *summary, uint16_t sender_id);
+static bool previously_received_request(uint32_t round_duration, aqueduct_app *app);
+static bool previously_received_data_packet(uint32_t round_duration, aqueduct_app *app);
+static void handle_summary(uint32_t round_duration, comBuf *buffer);
+//static void log_profile(aqueduct_profile *profile, uint16_t sender_id);
+static void handle_profile(comBuf *buffer);
+void handle_request(comBuf *buffer);
+static void parse_com_buf(uint32_t round_duration, comBuf *buffer);
+static comBuf *aqueduct_recv(uint8_t port);
+static void timeout_alarm(void);
+static void listen(uint32_t round_duration, uint32_t timeout_ms);
+static void aqueduct_send(comBuf *buffer, uint8_t port);
+static void send_summary(aqueduct_app *app);
+static uint32_t adjust_round_duration(bool inconsistency, uint32_t current_round_duration);
+static void send_profile(aqueduct_app *app);
+//static uint8_t get_num_updates_overheard(uint8_t image_ID, uint8_t version);
+//static bool are_summaries_consistent(void);
+static void aqueduct_maintain(void);
+
+/**
+ * @brief Changes the state (not sure if this is really that useful)
+ */
+static void change_state(uint8_t new_state)
+{
+	assert(((my_state == AQUEDUCT_RX && new_state == AQUEDUCT_MAINTAIN) ||
+			(my_state == AQUEDUCT_TX && new_state == AQUEDUCT_MAINTAIN) ||
+			(my_state == AQUEDUCT_FWD && new_state == AQUEDUCT_MAINTAIN) ||
+			(my_state == AQUEDUCT_MAINTAIN &&
+			(new_state == AQUEDUCT_RX || new_state == AQUEDUCT_TX || new_state == AQUEDUCT_MAINTAIN))),
+	"Illegal state change");
+
+	DEBUG_P4("===========> STATE = %C\n", new_state);
+	reset_logs();
+	my_state = new_state;
+}
+
+/**
+ * @brief Returns a random uint32_t between low and high
+ */
+static uint32_t random_time(uint32_t low, uint32_t high)
+{
+	uint32_t rand_val = rand() % RAND_MAX;
+	return low + rand_val % high;
+}
+
+/**
+ * @brief Initalizes the summary and profile logs
+ */
+static void reset_logs()
+{
+	DEBUG_P4("Resetting the logs\n");
+	int i;
+	for (i = 0; i < my_app_count; i++) {
+		my_app_memory[i].equivolant_summaries_heard = 0;
+		my_app_memory[i].outdated_summaries_heard = 0;
+		my_app_memory[i].newer_summaries_heard = 0;
+
+		my_app_memory[i].equivolant_profiles_heard = 0;
+		my_app_memory[i].outdated_profiles_heard = 0;
+		my_app_memory[i].newer_profiles_heard = 0;
+
+		my_app_memory[i].timed_out_requests = 0;
+		my_app_memory[i].requested_page = 0;
+		memset(my_app_memory[i].pages_needed, 0, sizeof(uint8_t) * AQUEDUCT_MAX_PAGES);
+		memset(my_app_memory[i].packets_needed, 0, sizeof(uint16_t) * 3);
+		
+		my_app_memory[i].last_request_sent_timestamp = 0;
+		my_app_memory[i].last_request_to_me_timestamp = 0;
+		my_app_memory[i].last_request_overheard_timestamp = 0;
+		my_app_memory[i].last_data_overheard_timestamp = 0;
+	}
+}
+
+/**
+ * @brief Returns TRUE if no more pages are needed.
+		   * @NOTE: Returns AQUEDUCT_MAX_PAGES if done.
+ */
+static uint8_t get_next_needed_page(aqueduct_app *app)
+{
+	uint8_t i;
+	for (i = app->requested_page; i < AQUEDUCT_MAX_PAGES; i++) {
+		if (app->pages_needed[i]) {
+			return i;
+		}
+	}
+	return i;
+}
+
+/**
+ * @brief Send Request
+ */
+static void send_request(aqueduct_app *app, uint16_t destination_ID)
+{
+	DEBUG_P1("send_request(): begin\n");
+	my_buf.size = sizeof(aqueduct_foot_request);
+	my_buf.data[0] = app->image_ID;                                          // 1
+	my_buf.data[1] = app->version;                                           // 1
+	
+	app->requested_page = get_next_needed_page(app);
+	my_buf.data[2] = app->requested_page;                                    // 1
+
+	memcpy(&my_buf.data[3], &app->packets_needed, sizeof(uint16_t) * 3);      // 6
+	my_buf.data[10] = my_ID;                           // 2
+	my_buf.data[12] = destination_ID;                  // 2
+	my_buf.data[14] = AQUEDUCT_PACKET_REQUEST;         // 1
+
+	app->last_request_sent_timestamp = mos_get_realtime();
+	
+	aqueduct_send(&my_buf, AQUEDUCT_LISTEN_PORT);
+	DEBUG_P1("send_request(): end\n");
+}
+
+/**
+ * @brief RX state - see R.1
+ * @TODO: Not done
+ */
+static void aqueduct_rx(aqueduct_app *app, uint16_t responsible_node)
+{
+	assert(my_state == AQUEDUCT_RX, "aqueduct_main -- not in AQUEDUCT_RX");
+	
+	/**
+	 * R.2
+	 *
+	 * After LAMBDA requests with a packet reception rate of ALPHA' <. ALPHA,
+	 * transition to MAINTAIN even if page GAMMA + 1 is incomplete.
+	 */
+	while (app->timed_out_requests < AQUEDUCT_LAMBDA && get_next_needed_page(app) == AQUEDUCT_MAX_PAGES) {
+		/**
+		 * R.1
+		 *
+		 * After not receiving a request or a data packet for time t = w * T_{tx} + r,
+		 * where r is a random value in the range T_r, transmit a request to node S.
+		 */
+		uint32_t timeout = (AQUEDUCT_OMEGA * AQUEDUCT_T_TX + AQUEDUCT_T_R) * 1000;
+		
+		DEBUG_P1("timeout = %l\n", timeout);
+		
+		app->last_request_overheard_timestamp = 0;
+		app->last_data_overheard_timestamp = 0;
+
+		/* HACK: sleep value seems to be off */
+		listen(0, timeout);
+
+		DEBUG_P1("last_request_overheard_timestamp = %l\n", app->last_request_overheard_timestamp);
+		DEBUG_P1("last_data_overheard_timestamp = %l\n", app->last_data_overheard_timestamp);
+
+		/* If we have not received a request or a data packet */
+		/* TODO: Should this be requests addressed to me? */
+		if (app->last_request_overheard_timestamp == 0 && app->last_data_overheard_timestamp == 0) {
+			send_request(app, responsible_node);
+		}
+	}
+
+	change_state(AQUEDUCT_MAINTAIN);
+}
+
+/**
+ * @brief Rule M.5(i).
+ * 
+ * TRUE if a request for a page p <= GAMMA was previously received within time
+ * t = 2 * T_{M, I}.  Helps synchronize the process; nodes that fall behind can catch up.
+ * 
+ * @param round_duration milliseconds
+ * @param app the app we're testing
+ */
+static bool previously_received_request(uint32_t round_duration, aqueduct_app *app)
+{
+	/* TODO: Find out what the unit of mos_get_realtime() is */
+	return (app->last_request_overheard_timestamp + round_duration * 2 >= mos_get_realtime());
+}
+
+/**
+ * @brief Rule M.5(ii).
+ *
+ * TRUE if a data packet for page p <= GAMMA + 1 was previously received within time t = T_{M, I}
+ * In other words, nodes may not issue a request if a transfer of a page is in progress.
+ *
+ * @param round_duration milliseconds
+ * @param app the app we're testing
+ */
+static bool previously_received_data_packet(uint32_t round_duration, aqueduct_app *app)
+{
+	/* TODO: Find out what the unit of mos_get_realtime() is */
+	return (app->last_data_overheard_timestamp + round_duration >= mos_get_realtime());
+}
+
+/**
+ * @brief Count the summaries we've seen -- part of rule M.1.
+ * @note  The list used in this gets reset after the round times out.
+ */
+static void handle_summary(uint32_t round_duration, comBuf *buffer)
+{
+	assert(GET_AQUEDUCT_PACKET_TYPE(buffer) == AQUEDUCT_PACKET_SUMMARY, "handle_summary: Not a summary packet.");
+	int i;
+
+	/* NOTE: I'm not sure how to compare two summary packets for ==.
+	 * This is my best guess.
+	 */
+	aqueduct_foot_summary *foot_summary = (aqueduct_foot_summary *)buffer->data;
+	aqueduct_summary *summary = &(foot_summary->summary);
+	aqueduct_app *mem;
+
+/*	
+	DEBUG_P1("sender id: %d\n", (uint16_t)foot_summary->id);
+	DEBUG_P1("sender dtb: %C\n", foot_summary->dtb);
+
+#if DEBUG >= 1
+	for (i = 0; i < my_summary_memory_slots_used; i++) {
+		DEBUG_P1("summary_memory: [%C] = [%C, %C, %C]\n",
+				 i, my_summary_memory[i].image_ID, my_summary_memory[i].version, my_summary_memory[i].high_page);
+	}
+#endif
+	*/
+
+	for (i = 0; i < my_app_count; i++) {
+		mem = &my_app_memory[i];
+		if (mem->image_ID == summary->image_ID &&
+			mem->version == summary->version &&
+			mem->high_page == summary->high_page) {
+			/* TODO: what happens if mem->high_page != sum->high_page?  does it matter? */
+			mem->equivolant_summaries_heard++;
+		} else if (mem->image_ID == summary->image_ID &&
+				   mem->version > summary->version) {
+			mem->outdated_summaries_heard++;
+		} else if (mem->image_ID == summary->image_ID &&
+				   mem->version < summary->version) {
+			/**
+			 * Rule M.5
+			 *
+			 * On receiving an advertisement with v' = v and H' > H, transition to RX
+			 */
+			mem->newer_summaries_heard++;
+
+			if (!previously_received_request(round_duration, mem) &&
+				!previously_received_data_packet(round_duration, mem)) {
+				change_state(AQUEDUCT_RX);
+				aqueduct_rx(mem, foot_summary->sender_ID);
+			}
+		}
+	}
+
+	/*
+#if DEBUG >= 1
+	for (i = 0; i < my_summary_received_log_count; i++) {
+		DEBUG_P1("summary_rcvd_log: [%C] = [%C, %C, %C, %C]\n", 
+				 i, my_summary_received_log[i].summary.image_ID, my_summary_received_log[i].summary.version, 
+				 my_summary_received_log[i].summary.high_page, my_summary_received_log[i].counter);
+		DEBUG_P1("\tsenders: |%C| : [", my_summary_received_log[i].sender_count);
+		for (j = 0; j < my_summary_received_log[i].sender_count; j++) {
+			DEBUG_P1("%d, ", my_summary_received_log[i].sender[j]);
+		}
+		DEBUG_P1("]\n");
+	}
+#endif
+	*/
+}
+
+/**
+ * @brief Compares the age of the pages from the new profile to the old one
+ */
+static void compare_profiles(aqueduct_app *app, uint8_t new_age[])
+{
+	int i;
+	for (i = 0; i < AQUEDUCT_MAX_PAGES; i++) {
+		if (new_age[i] < app->age[i]) {
+			DEBUG_P1("i = %d\n", i);
+			assert(FALSE, "The new page age is somehow less than the old page age\n");
+		} else if (new_age[i] > app->age[i]) {
+			/* is false if and only if new_age[i] == old_age[i] */
+			app->pages_needed[i] = (new_age[i] > app->age[i]);
+		}
+	}
+}
+
+/**
+ * @brief Logs the profile received -- M.4 requires this
+ */
+static void handle_profile(comBuf *buffer)
+{
+	assert(GET_AQUEDUCT_PACKET_TYPE(buffer) == AQUEDUCT_PACKET_PROFILE, "handle_summary: Not a summary packet.");	
+	aqueduct_foot_profile *foot_profile = (aqueduct_foot_profile *)buffer->data;
+	aqueduct_profile *profile = &(foot_profile->profile);
+	int i;
+
+	for (i = 0; i < my_app_count; i++) {
+		aqueduct_app *mem = &my_app_memory[i];
+		if (mem->image_ID == profile->image_ID &&
+			mem->version == profile->version) {
+			/* TODO: what happens if mem->high_page != sum->high_page?  does it matter? */
+			mem->equivolant_profiles_heard++;
+		} else if (mem->image_ID == profile->image_ID &&
+				   mem->version > profile->version) {
+			mem->outdated_profiles_heard++;
+		} else if (mem->image_ID == profile->image_ID &&
+				   mem->version < profile->version) {
+			mem->newer_profiles_heard++;
+			compare_profiles(mem, profile->age);
+		}
+	}	
+}
+
+/**
+ * @brief Implements Rule M.6.
+ */
+void handle_request(comBuf *buffer)
+{
+	aqueduct_foot_request *foot_request = (aqueduct_foot_request *)buffer;
+	assert(foot_request->type == AQUEDUCT_PACKET_REQUEST, "handle_request(): incorrect packet type");
+	aqueduct_request *req = &foot_request->request;
+	aqueduct_app *mem;
+	int i;
+
+	if (my_state == AQUEDUCT_MAINTAIN) {
+		/**
+		 * Rule M.6
+		 * 
+		 * On receiving a request for data from a page p <= H from version v,
+		 * transition to TX.
+		 */
+		for (i = 0; i < my_app_count; i++) {
+			mem = &my_app_memory[i];
+			if (mem->image_ID == req->image_ID &&
+				mem->version == req->version &&
+				mem->high_page >= req->page) {
+
+				/** This timestamp used in rule R.1 */
+				if (my_ID == foot_request->destination_ID) {
+					mem->last_request_to_me_timestamp = mos_get_realtime();
+				}
+
+				/** This timestamp used in rule M.2 and M.3 */
+				mem->last_request_overheard_timestamp = mos_get_realtime();
+				change_state(AQUEDUCT_TX);
+			}
+		}
+	}
+}
+
+/**
+ * @brief Handles data packets.  Related to R.2 - tracks the reception rate
+ */
+static void handle_data(comBuf *buffer)
+{
+	aqueduct_foot_data *foot_data = (aqueduct_foot_data *)buffer;
+	assert(foot_data->type == AQUEDUCT_PACKET_DATA, "handle_data(): incorrect packet type");
+	
+	aqueduct_data *data = (aqueduct_data *)foot_data;
+	aqueduct_app *app;
+	
+	int i;
+	for (i = 0; i < my_app_count; i++) {
+		app = &my_app_memory[i];
+		
+		if (data->image_ID == app->image_ID &&
+			data->version == app->version &&
+			data->page == app->requested_page) {
+			/**
+			 * This timestamp is useful for R.1, M.2, and M.3
+			 */
+			app->last_data_overheard_timestamp = mos_get_realtime();
+
+			/**
+			 * Process the payload
+			 *
+			 * 1. Validate CRC
+			 * 2. Store data or reject packet
+			 */
+			if (foot_data->crc == crc_compute((uint8_t *)data, sizeof(aqueduct_data))) {
+				
+			}
+		}
+		
+		
+//		foot_data->packet;
+//		foot_data->sender_ID;
+	}
+}
+
+/**
+ * @brief Dispatches incoming packets
+ */
+static void parse_com_buf(uint32_t round_duration, comBuf *buffer)
+{
+	uint8_t type = GET_AQUEDUCT_PACKET_TYPE(buffer);
+	
+	switch(type) {
+		case AQUEDUCT_PACKET_SUMMARY:
+			DEBUG_P2("Parsing AQUEDUCT_PACKET_SUMMARY\n");
+			handle_summary(round_duration, buffer);
+			break;
+		case AQUEDUCT_PACKET_PROFILE:
+			DEBUG_P2("Parsing AQUEDUCT_PACKET_PROFILE\n");
+			handle_profile(buffer);
+			break;
+		case AQUEDUCT_PACKET_REQUEST:
+			DEBUG_P2("Parsing AQUEDUCT_PACKET_REQUEST\n");
+			handle_request(buffer);
+			break;
+		case AQUEDUCT_PACKET_DATA:
+			DEBUG_P2("Parsing AQUEDUCT_PACKET_DATA\n");
+			handle_data(buffer);
+			break;
+		case AQUEDUCT_PACKET_COMMAND:
+			DEBUG_P2("Parsing AQUEDUCT_PACKET_COMMAND\n");
+			break;
+		default:
+			assert(FALSE, "parse_com_buf: Should not reach this case.\n");
+			break;
+	}
+
+}
+
+/**
+ * @brief Receives packets on the specified port.
+ * HACK: For some reason I can't get the net layer to cooperate.
+ * I gave up on it and decided to use only the com layer.
+ * I put the PORT on as the footer.
+ */
+static comBuf *aqueduct_recv(uint8_t port)
+{
+	comBuf *buffer;
+	uint8_t iface;
+	IF_SET set;
+
+	com_mode(IFACE_RADIO, IF_LISTEN); //put radio in listen mode
+	
+	IF_ZERO(&set);
+	IF_SET(IFACE_RADIO, &set);
+
+	iface = com_select(&set, COM_NOBLOCK);
+	if (IF_ISSET(IFACE_RADIO, &set)) {
+		buffer = com_recv(IFACE_RADIO);
+		if (buffer && buffer->data[buffer->size - 1] == AQUEDUCT_LISTEN_PORT) {
+			#if DEBUG >= 1
+				int i;
+				DEBUG_P1("<< buffer |%C| = [", buffer->size);
+				for (i = 0; i < buffer->size - 1; i++) {
+					DEBUG_P1("%C, ", buffer->data[i]);
+				}
+				DEBUG_P1("%C]\n", buffer->data[i]);
+			#endif
+			buffer->size--;
+			return buffer;
+		} else {
+			com_free_buf(buffer);
+			return NULL;
+		}
+	} else {
+		return NULL;
+	}
+}
+
+static bool my_timeout_alarm_flag; /* FALSE if the alarm has not been signaled.  TRUE otherwise */
+static uint32_t my_timeout_alarm_ms; /* Time that the timeout alarm waits for before setting the my_timeout_alarm_flag */
+
+/**
+ * @brief Sets the flag that times out the listen thread
+ */
+static void timeout_alarm(void)
+{
+	DEBUG_P3("Kill thread started\n");
+	my_timeout_alarm_flag = FALSE;
+	DEBUG_P3("Kill thread sleeping for %l ms\n", my_timeout_alarm_ms);
+	mos_thread_sleep(my_timeout_alarm_ms);
+	DEBUG_P3("Kill thread awake\n");
+	DEBUG_P1("Listen timed out\n");
+	my_timeout_alarm_flag = TRUE;
+	DEBUG_P3("Kill thread exit\n");
+}
+
+/**
+ * @brief Listen
+ * @TODO: round_duration really shouldn't be passed as a parameter...
+ */
+static void listen(uint32_t round_duration, uint32_t timeout_ms)
+{
+	timeout_ms = timeout_ms * 3;
+	comBuf *buffer;
+
+	my_timeout_alarm_ms = timeout_ms;
+
+	/* Alarms are more appropriate to use... but they're not implemented in mantis-0.9.5 */
+////	mos_alarm_t alarm;
+////	alarm.func = timeout_alarm;
+////	mos_alarm(&alarm, 3, 0);
+
+	if (mos_thread_new(timeout_alarm, 64, PRIORITY_NORMAL) != THREAD_OK) {
+		assert(FALSE, "Creation of timeout_alarm thread failed!\n");
+	}
+
+	DEBUG_P2("Listening...\n");
+
+	int i = 0;
+	while (!my_timeout_alarm_flag) {
+////		buffer = net_recv(AQUEDUCT_LISTEN_PORT);
+		if (i == 1000) {
+			DEBUG_P3(".");
+			i = 0;
+		}
+		i++;
+		
+		buffer = aqueduct_recv(AQUEDUCT_LISTEN_PORT);
+
+		if (!buffer) {
+			continue;
+		} else {
+			DEBUG_P1("Received comBuf\n");
+			mos_led_toggle(1);
+			parse_com_buf(round_duration, buffer);
+			com_free_buf(buffer);
+			DEBUG_P1("Listening...\n");
+		}
+	}
+}
+
+/**
+ * @brief Receives packets on the specified port.
+ * HACK: For some reason I can't get the net layer to cooperate.
+ * I gave up on it and decided to use only the com layer.
+ * I put on the PORT as a footer.
+ */
+static void aqueduct_send(comBuf *buffer, uint8_t port)
+{
+	buffer->size++;
+	buffer->data[buffer->size - 1] = port;
+	
+	#if DEBUG >= 1
+		int i;
+		DEBUG_P1("<< buffer |%C| = [", buffer->size);
+		for (i = 0; i < buffer->size - 1; i++) {
+			DEBUG_P1("%C, ", buffer->data[i]);
+		}
+		DEBUG_P1("%C]\n", buffer->data[i]);
+	#endif
+	com_send(IFACE_RADIO, buffer);
+}
+
+/**
+ * @brief Broadcasts the summary of image_ID and version.
+ */
+static void send_summary(aqueduct_app *app)
+{
+	DEBUG_P1("send_summary(): begin\n");
+	assert(app != NULL, "send_summary(): parameter \"app\" is null");
+	assert(app->image_ID < AQUEDUCT_MAX_UNIQUE_IMAGE_IDS && app->version < AQUEDUCT_MAX_UNIQUE_VERSION_IDS, 
+		   "send_summary - invalid ID/version ID");
+	/* NOTE: if we're being uber-careful we should assert that image_ID and version are stored in our "image memory" */
+
+	/* TODO: my_ID is a 16 bit unsigned int -- need to break this up into chunks. */
+	my_buf.size = sizeof(aqueduct_foot_summary);
+	my_buf.data[0] = app->image_ID;                //1
+	my_buf.data[1] = app->version;                 //1
+	my_buf.data[2] = app->high_page;               //1
+	my_buf.data[3] = my_ID;                        //2
+	my_buf.data[5] = my_dtb;                       //1
+	my_buf.data[6] = AQUEDUCT_PACKET_SUMMARY;      //1
+	
+	mos_led_toggle(0);
+////	net_send(&my_buf, SIMPLE_PROTO_ID, AQUEDUCT_LISTEN_PORT, NULL);
+	aqueduct_send(&my_buf, AQUEDUCT_LISTEN_PORT);
+	DEBUG_P1("send_summary(): end\n");
+}
+
+/**
+ * @brief part of MAINTAIN state.  Handles rule M.2, M.3
+ * @TODO: have not taken int account request inconsistencies or data packet inconsistencies!
+ */
+static uint32_t adjust_round_duration(bool inconsistency, uint32_t current_round_duration) 
+{
+	if (inconsistency) {
+		/* Rule M.2: 
+		 * If any overheard packet indicates an inconsistency among neighboring nodes 
+		 * (i.e. advertisements with OMEGA_PRIME != OMEGA, any requests, or any data packet) were 
+		 * overheard during round i, set T_{M, I} to T_L and begin a new round.
+		 */
+		return AQUEDUCT_T_L_SECONDS;
+	} else {
+		/* Rule M.3:
+		 * If no overheard packet indicates an inconsistency among neighbors during the previous
+		 * round, set T_{M,I} to min(2 * T_{M, I-1}, T_H)
+		 */
+		return min(2 * current_round_duration, AQUEDUCT_T_H_SECONDS);
+	}
+}
+
+/**
+ * @brief Send out an object profile for the appropriate image_id
+ */
+static void send_profile(aqueduct_app *app)
+{
+	DEBUG_P1("send_profile(): begin\n");
+	assert(app != NULL, "send_profile(): parameter \"app\" is null");
+	assert(app->image_ID < AQUEDUCT_MAX_UNIQUE_IMAGE_IDS && app->version < AQUEDUCT_MAX_UNIQUE_VERSION_IDS, 
+		   "send_profile - invalid ID/version ID");
+	/* NOTE: if we're being uber-careful we should assert that image_ID and version are stored in our "image memory" */
+
+	my_buf.size = sizeof(aqueduct_foot_profile);
+	my_buf.data[0] = app->image_ID;                                     //1
+	my_buf.data[1] = app->version;                                      //1
+	memcpy(&my_buf.data[2], &app->age, AQUEDUCT_MAX_PAGES);             //AQUEDUCT_MAX_PAGES
+	my_buf.data[AQUEDUCT_MAX_PAGES] = my_ID;                            //2
+	my_buf.data[AQUEDUCT_MAX_PAGES + 2] = AQUEDUCT_PACKET_PROFILE;      //1
+	
+	mos_led_toggle(0);
+////	net_send(&my_buf, SIMPLE_PROTO_ID, AQUEDUCT_LISTEN_PORT, NULL);
+	aqueduct_send(&my_buf, AQUEDUCT_LISTEN_PORT);
+	DEBUG_P1("send_profile(): end\n");
+}
+
+/**
+ * @brief MAINTAIN state.  Handles rule M.1.  Calls for handlers of M.2, M.3, and M.4
+ */
+static void aqueduct_maintain(void)
+{
+	DEBUG_P2("aqueduct_main thread started\n");
+	assert(my_state == AQUEDUCT_MAINTAIN, "aqueduct_main -- not in AQUEDUCT_MAINTAIN");
+
+	uint32_t current_round_duration;
+	current_round_duration = (uint32_t)AQUEDUCT_T_L_SECONDS;  //a.k.a. T_{M, I}
+
+	/* Each iteration of this loop is equivolent to round I */
+
+	while (my_state == AQUEDUCT_MAINTAIN) {
+		uint32_t r_i, timeout_ms;
+		bool inconsistency_overheard = FALSE;
+
+		r_i = random_time((current_round_duration / 2), (AQUEDUCT_T_H_SECONDS));
+		
+		timeout_ms = (r_i) * 1000;
+		DEBUG_P2("timeout_ms = %l, current_round_duration = %l, r_i = %l\n", timeout_ms, current_round_duration, r_i);
+
+		/* HACK: for some reason the clock is off... */
+		listen(current_round_duration, timeout_ms);
+		DEBUG_P2("returned from listen at time t_i + r_i\n");
+
+		/**** At this point we should be at time t_i + r_i.****/
+
+		/**
+		 * Rule M.1: 
+		 * "Broadcast an advertisement with summary OMEGA at time t_i + r_i only if
+		 * less than k advertisements with summary OMEGA_PRIME = OMEGA have been
+		 * received since time t_i."
+		 */
+		int j;
+		uint32_t time_before = mos_get_realtime();
+
+		for (j = 0; j < my_app_count; j++) {
+			aqueduct_app *app = &my_app_memory[j];
+
+			if (app->equivolant_summaries_heard < AQUEDUCT_K) {
+				send_summary(app);
+			}
+			
+			/**
+			 * Part of rule M.4
+			 */
+			if (app->outdated_summaries_heard || app->newer_summaries_heard) {
+				inconsistency_overheard = TRUE;
+			}
+
+			/**
+			 * Rule M.4:
+			 * Transmit the object profile for version v at time t_i + r_i only if an advertisement with version v' <. v was
+			 * received at or after time t_i and less than k attempts to update the object profile to version v have been overheard
+			 */
+			if (app->outdated_summaries_heard && app->equivolant_profiles_heard < AQUEDUCT_K) {
+				send_profile(app);
+			}
+		}
+
+		if (current_round_duration > timeout_ms + (mos_get_realtime() - time_before)) {
+			DEBUG_P2("Sleeping off the rest of the round\n");
+			mos_thread_sleep((current_round_duration * 1000) - timeout_ms);  // sleep off the rest of the round
+		}
+
+		/**** At this point we should be at time t_i + t_{m, i}.  This round is "over" ****/
+		current_round_duration = adjust_round_duration(inconsistency_overheard, current_round_duration);
+
+		/* reset the summary received log */
+		reset_logs();
+	}
+
+}
+
+void start(void)
+{
+	mos_node_id_set(NODE_ID);
+	my_ID = mos_node_id_get();
+
+	DEBUG_P4("************ Welcome to Aqueduct!  I'm node: %d\n", my_ID);
+	mos_led_toggle(0);
+	mos_led_toggle(1);
+	my_state = AQUEDUCT_MAINTAIN;
+
+	mos_mutex_init(&my_listen_lock);
+
+	/* HACK */
+	my_dtb = 9;
+
+//	srandom(mos_get_realtime());
+
+////net_init();        /* must start the net thread */
+////simple_proto_init();
+////flood_init();      /* flooding used for advertisements */
+
+	//mst_proto_init();  /* mst used for requests and data */
+	//net_ioctl(MST_PROTO_ID, SET_ADDR, (uint8_t)my_ID);
+	//net_ioctl(MST_PROTO_ID, SET_DTB, 20);
+
+	/* These expire after each round */
+	reset_logs();
+
+	my_app_count = 2;
+	memset(&my_app_memory[0], 0, sizeof(aqueduct_app));
+	memset(&my_app_memory[1], 0, sizeof(aqueduct_app));
+	memset(&my_app_memory[2], 0, sizeof(aqueduct_app));
+	memset(&my_app_memory[3], 0, sizeof(aqueduct_app));
+
+	my_app_memory[0].image_ID = 0;
+	my_app_memory[0].version = 2;
+	my_app_memory[0].high_page = 11;
+	
+	DEBUG_P1("Initially: %C, %C, %C\n", my_app_memory[0].image_ID, my_app_memory[0].version, my_app_memory[0].high_page);
+	
+	my_app_memory[1].image_ID = 1;
+	my_app_memory[1].version = 3;
+	my_app_memory[1].high_page = 10;
+
+	DEBUG_P1("Initially: %C, %C, %C\n", my_app_memory[1].image_ID, my_app_memory[1].version, my_app_memory[1].high_page);
+	
+	mos_multi_threaded();
+
+	mos_thread_new(aqueduct_maintain, 192, PRIORITY_NORMAL);
+
+}

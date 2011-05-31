@@ -1,0 +1,155 @@
+<head><title>
+AVR GCC calling conventions
+</title> </head>
+
+<BODY vLink=#004400 link=#004400 bgColor=#669966>
+
+<p align=right>
+<font size=1>
+English - <a href="/setlang.php3?setlang=1"><img src="/icons/gb.gif"
+	border="0" alt="<Eng>"></a>
+<a href="/setlang.php3?setlang=0"><img src="/icons/ru.gif"
+	border="0" alt="<Rus>"></a>
+- Russian
+</font>
+<p>
+<CENTER> <TABLE cellSpacing=0 cellPadding=0 width="90%" bgColor=white border=0>
+<TR>
+    <TD width=21 bgColor=#669966><IMG height=21
+      src="/img/topleft.gif" width=21></TD>
+    <TD align=left width="99%" bgColor=white><IMG height=1
+      src="/img/placeholder.gif" width=650></TD>
+    <TD width=21 bgColor=#669966><IMG height=21
+      src="/img/topright.gif" width=21></TD></TR>
+<TR>
+    <TD width=21 bgColor=white><IMG height=1
+      src="/img/placeholder.gif" width=21></TD>
+    <TD vAlign=top align=left bgColor=white>
+
+
+<h1>
+AVR GCC calling conventions
+</h1>
+
+<address>
+Thanks Paulo Soares &lt;psoares@consiste.pt>
+</address>
+
+<h2>
+Register Usage
+</h2>
+
+<table width="100%" cellpadding=2 cellspacing=0 border=0>
+<tr bgcolor="99cc99">
+	<th>Parameters</th>
+	<th>Param 1</th>
+	<th>Param 2</th>
+	<th>Param 3</th>
+	<th>Param 4</th>
+</tr>
+
+<tr>
+	<td>f(p8,p8)</td>
+	<td>R25</td>
+	<td>R24</td>
+	<td>--</td>
+	<td>--</td>
+</tr>
+
+<tr>
+	<td>f(p8,p8,p8,p8)</td>
+	<td>R25</td>
+	<td>R24</td>
+	<td>R23</td>
+	<td>R22</td>
+</tr>
+
+<tr>
+        <td>f(p16,p16)</td>
+        <td>R25:24*</td>
+        <td>R23:22</td>
+	<td>--</td>
+	<td>--</td>
+</tr>
+
+<tr>
+        <td>f(p16,p16,p16)</td>
+        <td>R25:24</td>
+        <td>R23:22</td>
+        <td>R21:20</td>
+	<td>--</td>
+</tr>
+
+<tr>
+        <td>f(p32,p32)</td>
+        <td>R25:24:23:22*</td>
+        <td>R21:20:19:18</td>
+	<td>--</td>
+	<td>--</td>
+</tr>
+
+<tr>
+        <td>f(p32,p32,p32)</td>
+        <td>R25:24:23:22</td>
+        <td>R21:20:19:18</td>
+        <td>R17:16:15:14</td>
+	<td>--</td>
+</tr>
+
+<tr>
+        <td>f(p8,p16,p32)</td>
+        <td>R25</td>
+        <td>R24:23</td>
+        <td>R22:21:20:19</td>
+	<td>--</td>
+</tr></table>
+<p>
+* MSB left, LSB right
+
+<h2>
+Return Value
+</h2>
+
+<table cellpadding=2 cellspacing=0 border=0>
+<tr bgcolor="99cc99">
+	<th>&nbsp;&nbsp;Size&nbsp;&nbsp;</th>
+	<th>&nbsp;&nbsp;Registers&nbsp;&nbsp;</th>
+</tr>
+<tr>
+	<td>&nbsp; p8</td>
+	<td>&nbsp; R25:24**</td>
+</tr>
+<tr>
+	<td>&nbsp; p16</td>
+	<td>&nbsp; R25:24</td>
+</tr>
+<tr>
+	<td>&nbsp; p32</td>
+	<td>&nbsp; R25:24:23:22</td>
+</tr>
+</table>
+<p>
+
+**  R25 is cleared
+
+    </TD>
+    <TD width=21 bgColor=white><IMG height=1
+      src="/img/placeholder.gif" width=21></TD>
+</TR><TR>
+    <TD width=21 bgColor=#669966 size="2"><IMG height=21
+      src="/img/bottomleft.gif" width=21></TD>
+    <TD width="99%" bgColor=white><IMG height=1
+      src="/img/placeholder.gif" width=1></TD>
+    <TD width=21 bgColor=#669966><IMG height=21
+      src="/img/bottomright.gif" width=21></TD></TR>
+</TABLE>
+<p>
+<center><table><tr><td>
+<A href="http://www.tema.ru/rrr/"><img src="/icons/dnepro.gif" border=0></a>
+</td><td> <FONT SIZE=1> Copyright (C) 1996-2001
+	    Сергей Вакуленко
+	 <br>
+	<a href="mailto:vak@cronyx.ru">vak@cronyx.ru</a>
+	</font>
+</td></tr></table>
+</center></BODY></HTML>
